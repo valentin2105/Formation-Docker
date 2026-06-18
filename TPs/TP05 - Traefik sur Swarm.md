@@ -231,10 +231,10 @@ docker stack deploy -c hello-stack.yml hello
 docker service ls | grep hello       # hello_hello   2/2
 ```
 
-> **Cluster mono-nœud ?** S'il n'y a pas de worker, la contrainte
-> `node.role == worker` empêchera le scheduling (`0/2`). Retirez simplement les
-> deux lignes `placement: constraints: - node.role == worker` du fichier, puis
-> redéployez. Traefik et `hello` cohabiteront alors sur le manager.
+> Sur notre cluster **4 nœuds**, la contrainte `node.role == worker` répartit les
+> 2 réplicas sur les workers, tandis que Traefik reste sur le manager (cf. §4).
+> Séparer le rôle « entrée » (manager) du rôle « charge applicative » (workers)
+> est une bonne pratique.
 
 ---
 
