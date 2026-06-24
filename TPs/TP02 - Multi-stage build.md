@@ -68,7 +68,7 @@ WORKDIR /app
 COPY go.mod .
 COPY main.go .
 
-RUN go build -o server main.go
+RUN CGO_ENABLED=0 go build -o server main.go
 
 EXPOSE 8080
 
