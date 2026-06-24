@@ -8,7 +8,8 @@
 > **Objectifs :**
 > - Comprendre qu'un conteneur n'est **pas une machine virtuelle**, mais un
 >   processus Linux ordinaire isolé par le noyau.
-> - Observer les **namespaces**, les **cgroups** et le stockage **overlay2**.
+> - Observer les **namespaces**, les **cgroups** et le stockage **overlay**
+>   (snapshotter containerd, driver par défaut depuis Docker 29).
 > - Comprendre pourquoi les couches d'image sont en **lecture seule**.
 
 ---
@@ -163,21 +164,57 @@ docker stats --no-stream lab
 ➡️ Les limites ne sont pas « simulées » par Docker : elles sont **imposées par le
 noyau** via les fichiers du cgroup.
 
-### Étape 5 — Explorer le stockage overlay2
+### Étape 5 — Explorer le stockage overlay
+
+> **⚠️ Docker 29+ — fin du graph driver `overlay2`.**
+> Depuis Docker 29, Docker utilise par défaut le **snapshotter containerd**
+> (`overlayfs`) au lieu de l'ancien graph driver `overlay2`. Le système de
+> fichiers reste de l'**overlay** (mêmes principes lower/upper/merged), mais il
+> n'est plus géré par Docker lui-même. Conséquence pratique :
+> `docker inspect` renvoie désormais `"GraphDriver": { "Name": "overlayfs",
+> "Data": null }` — les champs `.GraphDriver.Data`, `.UpperDir`, `.LowerDir`
+> **n'existent plus**. Les couches sont aussi rangées ailleurs :
+> `/var/lib/docker/containerd/.../snapshots/...` au lieu de
+> `/var/lib/docker/overlay2/`.
+>
+> Vérifiez votre driver :
+>
+> ```bash
+> docker info --format '{{ .Driver }}'
+> # overlayfs  -> snapshotter containerd (Docker 29+, ce TP)
+> # overlay2   -> ancien graph driver (Docker <= 28)
+> ```
+>
+> On va donc lire les couches **directement depuis le noyau**
+> (`/proc/$PID/mountinfo`), qui est la source de vérité quel que soit le driver.
 
 Regardez comment le système de fichiers du conteneur est monté :
 
 ```bash
 mount | grep overlay
-# overlay on /var/lib/docker/overlay2/<id>/merged type overlay
+# le point de montage "merged" est exposé par le runtime containerd, p.ex. :
+# overlay on /run/containerd/io.containerd.runtime.v2.task/moby/<id>/rootfs type overlay
 #   (lowerdir=...:...:...,upperdir=...,workdir=...)
+# les couches (lower/upper) vivent, elles, sous
+#   /var/lib/docker/containerd/.../snapshots/<N>/fs
 ```
 
-Détail des répertoires (via Docker) :
+Détail des répertoires — on lit les options du montage overlay du conteneur dans
+la table de montage du noyau (le montage racine `/` du conteneur, vu via son PID
+hôte) :
 
 ```bash
-docker inspect -f '{{ json .GraphDriver.Data }}' lab | tr ',' '\n'
+# La ligne de montage overlay du conteneur (mountpoint "/" dans son namespace)
+sudo awk '$5=="/" && /overlay/ {print $NF}' /proc/$PID/mountinfo | tr ',' '\n'
+# lowerdir=...
+# upperdir=...
+# workdir=...
 ```
+
+> 💡 `/proc/$PID/mountinfo` décrit les montages tels que les voit le processus :
+> le `/` du conteneur est en réalité un montage **overlay** dont les options
+> contiennent `lowerdir`, `upperdir` et `workdir`. Aucune dépendance à Docker ni
+> au driver.
 
 Vous y trouverez trois notions clés d'overlayfs :
 
@@ -194,15 +231,21 @@ Faites une modification **dans le conteneur** puis observez où elle atterrit :
 ```bash
 docker exec lab sh -c "echo 'coucou' > /tmp/test.txt"
 
+# On récupère l'upperdir (couche d'écriture) depuis le montage overlay du noyau.
+# Remplace l'ancien `docker inspect .GraphDriver.Data.UpperDir`, qui renvoie
+# désormais une valeur vide avec le snapshotter containerd (Docker 29+).
+UPPER=$(sudo awk '$5=="/" && /overlay/ {print $NF}' /proc/$PID/mountinfo \
+  | tr ',' '\n' | sed -n 's/^upperdir=//p')
+echo "upperdir = $UPPER"
+
 # Le fichier n'existe PAS dans les couches d'image (lowerdir),
 # il apparaît dans la couche d'écriture (upperdir) :
-UPPER=$(docker inspect -f '{{ .GraphDriver.Data.UpperDir }}' lab)
 sudo find $UPPER -name test.txt
-# .../diff/tmp/test.txt
+# .../fs/tmp/test.txt
 ```
 
 Modifier un fichier qui **existe déjà dans l'image** déclenche un
-**copy-on-write** : overlay2 copie le fichier depuis la couche image (lecture
+**copy-on-write** : overlayfs copie le fichier depuis la couche image (lecture
 seule) vers la couche d'écriture, puis applique la modification dessus.
 
 ➡️ Les couches d'image restent **immuables et partagées** entre tous les
@@ -217,9 +260,17 @@ partagent les mêmes `lowerdir` mais ont chacun leur `upperdir`.
 
 ```bash
 docker run -d --name lab2 reg.ntl.nc/proxy/library/python:3.12-slim sleep 600
-docker inspect -f '{{ .GraphDriver.Data.LowerDir }}' lab  | tr ':' '\n' | head
-docker inspect -f '{{ .GraphDriver.Data.LowerDir }}' lab2 | tr ':' '\n' | head
-# les couches de base communes sont identiques
+PID2=$(docker inspect -f '{{.State.Pid}}' lab2)
+
+# On lit le lowerdir (couches d'image) de chaque conteneur depuis le noyau.
+# (Remplace `docker inspect .GraphDriver.Data.LowerDir`, vide avec containerd.)
+lowerdirs() {
+  sudo awk '$5=="/" && /overlay/ {print $NF}' /proc/$1/mountinfo \
+    | tr ',' '\n' | sed -n 's/^lowerdir=//p' | tr ':' '\n'
+}
+lowerdirs $PID  | tail -n 3   # couches de base de lab
+lowerdirs $PID2 | tail -n 3   # couches de base de lab2
+# les couches de base communes (snapshots containerd) sont identiques
 ```
 
 ---
@@ -239,6 +290,9 @@ docker rm -f lab lab2
 2. `lsns`, `nsenter`, `/proc/<pid>/ns`, `/sys/fs/cgroup` permettent de tout
    observer avec des outils **Linux standards** : Docker n'invente rien, il
    assemble.
-3. overlay2 empile des **couches en lecture seule** (image) sous une **couche
+3. overlay empile des **couches en lecture seule** (image) sous une **couche
    d'écriture** (conteneur), avec **copy-on-write** : d'où des images légères,
-   partagées et immuables.
+   partagées et immuables. Depuis Docker 29, ce stockage est géré par le
+   **snapshotter containerd** (`overlayfs`) et non plus par le graph driver
+   `overlay2` : `docker inspect .GraphDriver.Data` est vide, on lit donc les
+   couches dans la table de montage du noyau (`/proc/<pid>/mountinfo`).
